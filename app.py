@@ -16,13 +16,25 @@ from langchain_groq import ChatGroq
 # App + ENV setup
 # -------------------------
 app = Flask(__name__)
-load_dotenv()
+load_dotenv()  # locally uses .env; on Render it will use Render env vars
 
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # holds GROQ key (tutorial constraint)
 
-os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+# Fail fast with a clear error (prevents silent None issues)
+missing = []
+if not PINECONE_API_KEY:
+    missing.append("PINECONE_API_KEY")
+if not OPENAI_API_KEY:
+    missing.append("OPENAI_API_KEY (your GROQ key value)")
+if missing:
+    raise RuntimeError(
+        f"Missing required environment variables: {', '.join(missing)}. "
+        f"Set them in Render → Service → Environment."
+    )
+
+# IMPORTANT: do NOT overwrite env vars with None.
+# If they're already set, leave them as-is. (No need to set them again.)
 
 
 # -------------------------
@@ -59,7 +71,7 @@ chatModel = ChatGroq(
 prompt = ChatPromptTemplate.from_messages(
     [
         ("system", system_prompt),
-        ("human", "{input}")
+        ("human", "Context:\n{context}\n\nQuestion:\n{input}")
     ]
 )
 
@@ -67,10 +79,11 @@ prompt = ChatPromptTemplate.from_messages(
 # -------------------------
 # RAG Chain (LangChain 1.x)
 # -------------------------
+# Make sure context is computed from the user's question.
 rag_chain = (
     {
         "context": retriever,
-        "input": RunnablePassthrough()
+        "input": RunnablePassthrough(),
     }
     | prompt
     | chatModel
@@ -88,13 +101,17 @@ def index():
 
 @app.route("/get", methods=["GET", "POST"])
 def chat():
-    msg = request.form["msg"]
+    msg = request.form.get("msg", "")
+    if not msg.strip():
+        return "Please enter a question."
+
     response = rag_chain.invoke(msg)
     return response
 
 
 # -------------------------
-# Run
+# Run (Render-safe)
 # -------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=True)
+    port = int(os.environ.get("PORT", 8080))  # Render sets PORT
+    app.run(host="0.0.0.0", port=port, debug=False)
