@@ -5,6 +5,10 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 
+from langchain_community.embeddings import FastEmbedEmbeddings
+
+def download_fastembed_embeddings():
+    return FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 
 # Extract Data From the PDF File
 def load_pdf_file(data):

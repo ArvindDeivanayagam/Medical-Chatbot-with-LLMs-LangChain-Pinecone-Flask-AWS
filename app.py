@@ -2,7 +2,7 @@ from flask import Flask, render_template, request
 from dotenv import load_dotenv
 import os
 
-from src.helper import download_hugging_face_embeddings
+from langchain_community.embeddings import FastEmbedEmbeddings
 from src.prompt import system_prompt
 
 from langchain_pinecone import PineconeVectorStore
@@ -11,7 +11,7 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from langchain_groq import ChatGroq
 
-
+embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 # -------------------------
 # App + ENV setup
 # -------------------------
@@ -19,14 +19,14 @@ app = Flask(__name__)
 load_dotenv()  # locally uses .env; on Render it will use Render env vars
 
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # holds GROQ key (tutorial constraint)
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")  # holds GROQ key (tutorial constraint)
 
 # Fail fast with a clear error (prevents silent None issues)
 missing = []
 if not PINECONE_API_KEY:
     missing.append("PINECONE_API_KEY")
-if not OPENAI_API_KEY:
-    missing.append("OPENAI_API_KEY (your GROQ key value)")
+if not GROQ_API_KEY:
+    missing.append("GROQ_API_KEY (your GROQ key value)")
 if missing:
     raise RuntimeError(
         f"Missing required environment variables: {', '.join(missing)}. "
@@ -42,7 +42,8 @@ if missing:
 # -------------------------
 embeddings = download_hugging_face_embeddings()
 
-index_name = "medical-chatbot"
+index_name = "medical-chatbot-bge"
+
 
 docsearch = PineconeVectorStore.from_existing_index(
     index_name=index_name,
@@ -61,7 +62,7 @@ retriever = docsearch.as_retriever(
 chatModel = ChatGroq(
     model="llama-3.1-8b-instant",
     temperature=0.2,
-    api_key=OPENAI_API_KEY
+    api_key=GROQ_API_KEY
 )
 
 
@@ -113,5 +114,6 @@ def chat():
 # Run (Render-safe)
 # -------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))  # Render sets PORT
-    app.run(host="0.0.0.0", port=port, debug=False)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
