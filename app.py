@@ -2,29 +2,32 @@ from flask import Flask, render_template, request
 from dotenv import load_dotenv
 import os
 import logging
+import time
+import re
+from functools import lru_cache
+from typing import List, Tuple
 
 from langchain_community.embeddings import FastEmbedEmbeddings
-from src.prompt import system_prompt
-
 from langchain_pinecone import PineconeVectorStore
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 from langchain_groq import ChatGroq
 
+from src.prompt import system_prompt  # keep your system prompt in src/prompt.py
+
 
 # -------------------------
 # App + ENV setup
 # -------------------------
 app = Flask(__name__)
-load_dotenv()  # locally uses .env; on Render it will use Render env vars
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
-# Fail fast with a clear error (prevents silent None issues)
 missing = []
 if not PINECONE_API_KEY:
     missing.append("PINECONE_API_KEY")
@@ -38,63 +41,207 @@ if missing:
 
 
 # -------------------------
-# Embeddings + Vector Store
+# Config
 # -------------------------
-# ✅ FastEmbed (no torch / sentence-transformers)
-embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+INDEX_NAME = "medical-chatbot-bge"
 
-# ✅ Make sure this matches the index you created with FastEmbed ingestion
-index_name = "medical-chatbot-bge"
+# Retrieve more candidates (k=12) then rerank down to top 3
+RETRIEVE_K = 12
+FINAL_K = 3
 
-docsearch = PineconeVectorStore.from_existing_index(
-    index_name=index_name,
-    embedding=embeddings
-)
-
-retriever = docsearch.as_retriever(
-    search_type="similarity",
-    search_kwargs={"k": 3}
-)
+# In-memory caching for repeated questions
+CACHE_TTL_SECONDS = 10 * 60  # 10 minutes
+MAX_CACHE_ITEMS = 256
 
 
 # -------------------------
-# LLM (Groq)
+# Lightweight safety guardrails (rule-based)
 # -------------------------
-chatModel = ChatGroq(
-    model="llama-3.1-8b-instant",
-    temperature=0.2,
-    api_key=GROQ_API_KEY
-)
+EMERGENCY_PATTERNS = [
+    r"\bchest pain\b",
+    r"\bshortness of breath\b",
+    r"\bdifficulty breathing\b",
+    r"\bfaint(ing)?\b",
+    r"\bunconscious\b",
+    r"\bseizure\b",
+    r"\bstroke\b",
+    r"\bface droop\b",
+    r"\bslurred speech\b",
+    r"\bone-sided weakness\b",
+    r"\bsuicid(al|e)\b",
+    r"\bself-harm\b",
+    r"\boverdose\b",
+    r"\bheavy bleeding\b",
+    r"\bcan'?t stop bleeding\b",
+]
+
+MED_ADVICE_PATTERNS = [
+    r"\bdosage\b",
+    r"\bdose\b",
+    r"\bhow much\b.*\bmg\b",
+    r"\bpregnan(t|cy)\b.*\bmed(ic|icine)\b",
+    r"\bprescription\b",
+    r"\bshould I take\b",
+    r"\bcan I take\b",
+    r"\bdrug interaction\b",
+]
+
+
+def guardrail_response(user_text: str) -> str | None:
+    """
+    Returns a safety response string if the message triggers a guardrail,
+    otherwise returns None to continue normal RAG flow.
+    """
+    t = user_text.lower().strip()
+
+    for pat in EMERGENCY_PATTERNS:
+        if re.search(pat, t):
+            return (
+                "This could be a medical emergency. Please seek immediate medical care "
+                "or call your local emergency number right now."
+            )
+
+    for pat in MED_ADVICE_PATTERNS:
+        if re.search(pat, t):
+            return (
+                "I can’t provide medication dosing or personalized medical advice. "
+                "Please consult a licensed clinician or pharmacist for guidance."
+            )
+
+    return None
 
 
 # -------------------------
-# Prompt
+# Caching helpers (simple TTL cache)
 # -------------------------
+_answer_cache: dict[str, Tuple[float, str]] = {}
+
+
+def cache_get(key: str) -> str | None:
+    item = _answer_cache.get(key)
+    if not item:
+        return None
+    ts, val = item
+    if (time.time() - ts) > CACHE_TTL_SECONDS:
+        _answer_cache.pop(key, None)
+        return None
+    return val
+
+
+def cache_set(key: str, val: str) -> None:
+    # basic size control
+    if len(_answer_cache) >= MAX_CACHE_ITEMS:
+        # remove oldest entry
+        oldest_key = min(_answer_cache.items(), key=lambda kv: kv[1][0])[0]
+        _answer_cache.pop(oldest_key, None)
+    _answer_cache[key] = (time.time(), val)
+
+
+# -------------------------
+# Model + vectorstore (cached in memory)
+# -------------------------
+@lru_cache(maxsize=1)
+def get_embeddings():
+    # FastEmbed (no torch)
+    return FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+
+
+@lru_cache(maxsize=1)
+def get_vectorstore():
+    return PineconeVectorStore.from_existing_index(
+        index_name=INDEX_NAME,
+        embedding=get_embeddings(),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_retriever():
+    return get_vectorstore().as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": RETRIEVE_K},
+    )
+
+
+@lru_cache(maxsize=1)
+def get_llm():
+    return ChatGroq(
+        model="llama-3.1-8b-instant",
+        temperature=0.2,
+        api_key=GROQ_API_KEY,
+    )
+
+
 prompt = ChatPromptTemplate.from_messages(
     [
         ("system", system_prompt),
-        ("human", "Context:\n{context}\n\nQuestion:\n{input}")
+        ("human", "Context:\n{context}\n\nQuestion:\n{input}"),
     ]
 )
 
 
-def format_docs(docs):
-    """Convert retrieved Document objects into a clean context string."""
+def format_docs(docs) -> str:
     return "\n\n".join(d.page_content for d in docs)
 
 
 # -------------------------
-# RAG Chain (LangChain 1.x)
+# Lightweight reranking (free + safe baseline)
 # -------------------------
-rag_chain = (
-    {
-        "context": retriever | RunnableLambda(format_docs),
-        "input": RunnablePassthrough(),
-    }
-    | prompt
-    | chatModel
-    | StrOutputParser()
-)
+STOPWORDS = {
+    "the","a","an","and","or","to","of","in","on","for","with","is","are","was","were",
+    "be","been","being","as","at","by","from","that","this","it","you","your","i","we",
+    "they","them","their","but","not","do","does","did","can","could","should","would"
+}
+
+
+def tokenize(text: str) -> set[str]:
+    words = re.findall(r"[a-zA-Z0-9]+", text.lower())
+    return {w for w in words if w not in STOPWORDS and len(w) > 2}
+
+
+def rerank_docs(query: str, docs: List) -> List:
+    """
+    Simple keyword-overlap reranker to improve relevance without heavy ML models.
+    Safe for Render free tier. Later you can swap this for a real reranker.
+    """
+    q_tokens = tokenize(query)
+    if not q_tokens:
+        return docs[:FINAL_K]
+
+    scored = []
+    for d in docs:
+        d_tokens = tokenize(d.page_content)
+        score = len(q_tokens.intersection(d_tokens))
+        scored.append((score, d))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = [d for score, d in scored[:FINAL_K]]
+    return top
+
+
+def retrieve_and_prepare_context(user_q: str) -> str:
+    retriever = get_retriever()
+    docs = retriever.invoke(user_q)  # List[Document]
+    docs = rerank_docs(user_q, docs)
+    return format_docs(docs)
+
+
+@lru_cache(maxsize=1)
+def get_chain():
+    llm = get_llm()
+
+    # Build context dynamically per query (retrieve -> rerank -> format)
+    context_runnable = RunnableLambda(lambda q: retrieve_and_prepare_context(q))
+
+    chain = (
+        {
+            "context": context_runnable,
+            "input": RunnablePassthrough(),
+        }
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    return chain
 
 
 # -------------------------
@@ -105,16 +252,30 @@ def index():
     return render_template("chat.html")
 
 
-@app.route("/get", methods=["POST"])
+@app.route("/get", methods=["GET", "POST"])
 def chat():
-    msg = request.form.get("msg", "")
-    if not msg.strip():
+    msg = (request.form.get("msg", "") or request.args.get("msg", "")).strip()
+    if not msg:
         return "Please enter a question."
+
+    # Guardrails first
+    g = guardrail_response(msg)
+    if g:
+        return g
+
+    # Cache repeated questions
+    cached = cache_get(msg)
+    if cached:
+        return cached
 
     try:
         logging.info(f"Question: {msg[:200]}")
-        response = rag_chain.invoke(msg)
+        response = get_chain().invoke(msg)
+
+        # Cache response
+        cache_set(msg, response)
         return response
+
     except Exception:
         logging.exception("RAG invocation failed")
         return "Sorry — something went wrong on the server. Please try again."
