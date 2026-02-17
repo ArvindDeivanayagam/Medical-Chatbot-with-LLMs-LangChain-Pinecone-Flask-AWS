@@ -4,13 +4,15 @@ import os
 import logging
 import time
 import re
+import json
+import hashlib
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import List, Tuple
 
 from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 from langchain_groq import ChatGroq
 
@@ -55,6 +57,29 @@ MAX_CACHE_ITEMS = 256
 
 
 # -------------------------
+# Analytics logging (privacy-safe)
+# -------------------------
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _hash_question(text: str) -> str:
+    # Do NOT store raw user questions (may contain PHI).
+    # Store only a short stable hash for analytics.
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def log_event(event: str, **fields) -> None:
+    payload = {
+        "ts": _now_iso(),
+        "event": event,
+        **fields,
+    }
+    # Print is best on Render (shows in Logs)
+    print("ANALYTICS " + json.dumps(payload, ensure_ascii=False))
+
+
+# -------------------------
 # Lightweight safety guardrails (rule-based)
 # -------------------------
 EMERGENCY_PATTERNS = [
@@ -94,10 +119,6 @@ MED_ADVICE_PATTERNS = [
 
 
 def guardrail_response(user_text: str) -> str | None:
-    """
-    Returns a safety response string if the message triggers a guardrail,
-    otherwise returns None to continue normal RAG flow.
-    """
     t = (user_text or "").lower().strip()
 
     for pat in EMERGENCY_PATTERNS:
@@ -135,9 +156,7 @@ def cache_get(key: str) -> str | None:
 
 
 def cache_set(key: str, val: str) -> None:
-    # basic size control
     if len(_answer_cache) >= MAX_CACHE_ITEMS:
-        # remove oldest entry
         oldest_key = min(_answer_cache.items(), key=lambda kv: kv[1][0])[0]
         _answer_cache.pop(oldest_key, None)
     _answer_cache[key] = (time.time(), val)
@@ -218,27 +237,25 @@ def rerank_docs(query: str, docs: List) -> List:
     return [d for score, d in scored[:FINAL_K]]
 
 
-def retrieve_and_prepare_context(user_q: str) -> str:
+def retrieve_and_prepare_context(user_q: str) -> Tuple[str, int, int]:
+    """
+    Returns: (context_text, doc_count_before_rerank, doc_count_after_rerank)
+    """
     retriever = get_retriever()
     docs = retriever.invoke(user_q)  # List[Document]
+    before = len(docs)
     docs = rerank_docs(user_q, docs)
-    return format_docs(docs)
+    after = len(docs)
+    return format_docs(docs), before, after
 
 
 @lru_cache(maxsize=1)
 def get_chain():
+    """
+    Chain takes a dict input: {"context": "...", "input": "..."} to avoid double retrieval.
+    """
     llm = get_llm()
-    context_runnable = RunnableLambda(lambda q: retrieve_and_prepare_context(q))
-
-    chain = (
-        {
-            "context": context_runnable,
-            "input": RunnablePassthrough(),
-        }
-        | prompt
-        | llm
-        | StrOutputParser()
-    )
+    chain = prompt | llm | StrOutputParser()
     return chain
 
 
@@ -257,7 +274,6 @@ def health():
 
 @app.route("/warmup")
 def warmup():
-    # optional warm route (useful for uptime pings if you prefer this)
     return "warmed", 200
 
 
@@ -269,32 +285,74 @@ def chat():
     if not msg:
         return "Please enter a question."
 
+    q_hash = _hash_question(msg)
+    t0 = time.perf_counter()
+
     # 1) Guardrails first
     safety = guardrail_response(msg)
     if safety:
+        log_event(
+            "request",
+            q_hash=q_hash,
+            outcome="guardrail",
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+        )
         return safety
 
     # 2) Cache next
     cache_key = msg.lower()
     cached = cache_get(cache_key)
     if cached:
+        log_event(
+            "request",
+            q_hash=q_hash,
+            outcome="cache_hit",
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+        )
         return cached
 
     try:
         logging.info(f"Incoming question: {msg[:200]}")
 
-        chain = get_chain()  # cached chain (fast)
-        start = time.perf_counter()
-        response = chain.invoke(msg)
-        elapsed = time.perf_counter() - start
-        logging.info(f"Latency_seconds={elapsed:.2f}")
+        # 3) Retrieval (single time) + stats
+        t_retr = time.perf_counter()
+        context_text, doc_before, doc_after = retrieve_and_prepare_context(msg)
+        retr_elapsed = time.perf_counter() - t_retr
+
+        # 4) LLM generation (single time) using precomputed context
+        chain = get_chain()
+        t_llm = time.perf_counter()
+        response = chain.invoke({"context": context_text, "input": msg})
+        llm_elapsed = time.perf_counter() - t_llm
+
+        total_elapsed = time.perf_counter() - t0
+        logging.info(f"Latency_seconds={total_elapsed:.2f}")
 
         if isinstance(response, str) and response.strip():
             cache_set(cache_key, response)
 
+        log_event(
+            "request",
+            q_hash=q_hash,
+            outcome="ok",
+            doc_count=doc_before,
+            final_k=doc_after,
+            retrieval_latency_ms=int(retr_elapsed * 1000),
+            llm_latency_ms=int(llm_elapsed * 1000),
+            latency_ms=int(total_elapsed * 1000),
+        )
+
         return response
 
     except Exception as e:
+        total_elapsed = time.perf_counter() - t0
+        log_event(
+            "request",
+            q_hash=q_hash,
+            outcome="error",
+            error=str(e)[:200],
+            latency_ms=int(total_elapsed * 1000),
+        )
         logging.exception("RAG invocation failed")
         return f"SERVER ERROR: {str(e)}"
 
