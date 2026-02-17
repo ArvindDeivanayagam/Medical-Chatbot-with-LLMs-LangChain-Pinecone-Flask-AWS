@@ -254,31 +254,25 @@ def index():
 
 @app.route("/get", methods=["GET", "POST"])
 def chat():
-    msg = (request.form.get("msg", "") or request.args.get("msg", "")).strip()
-    if not msg:
+    msg = request.values.get("msg", "")
+    if not msg.strip():
         return "Please enter a question."
 
-    # Guardrails first
-    g = guardrail_response(msg)
-    if g:
-        return g
-
-    # Cache repeated questions
-    cached = cache_get(msg)
-    if cached:
-        return cached
-
     try:
-        logging.info(f"Question: {msg[:200]}")
-        response = get_chain().invoke(msg)
+        logging.info(f"Incoming question: {msg}")
 
-        # Cache response
-        cache_set(msg, response)
+        chain = rag_chain
+        logging.info("Chain ready")
+
+        response = chain.invoke(msg)
+        logging.info("Response generated successfully")
+
         return response
 
-    except Exception:
+    except Exception as e:
         logging.exception("RAG invocation failed")
-        return "Sorry — something went wrong on the server. Please try again."
+        return f"SERVER ERROR: {str(e)}"
+
 
 
 # -------------------------
