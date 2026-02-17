@@ -74,22 +74,22 @@ EMERGENCY_PATTERNS = [
     r"\bheavy bleeding\b",
     r"\bcan'?t stop bleeding\b",
     r"\bleft arm numb(ness)?\b",
+    r"\bnot breathing\b",
 ]
 
-# ✅ UPDATED: stronger medication/dosing intent detection
 MED_ADVICE_PATTERNS = [
-    r"\bhow much\b.*\b(take|tablet|medicine|medication|pill|dose)\b",
-    r"\bshould i take\b",
-    r"\bcan i take\b",
-    r"\bhow often\b.*\b(take|dose)\b",
     r"\bdosage\b",
     r"\bdose\b",
-    r"\bparacetamol\b",
-    r"\bibuprofen\b",
-    r"\bcrocin\b",
-    r"\btylenol\b",
+    r"\bhow much\b.*\bmg\b",
+    r"\bhow often\b.*\b(take|use)\b",
+    r"\bpregnan(t|cy)\b.*\bmed(ic|icine)\b",
+    r"\bprescription\b",
+    r"\bshould i take\b",
+    r"\bcan i take\b",
     r"\bdrug interaction\b",
-    r"\bmedication for\b",
+    r"\bibuprofen\b.*\bhow (often|much)\b",
+    r"\bparacetamol\b.*\bhow (often|much)\b",
+    r"\bcrocin\b.*\b(dose|how much|how often)\b",
 ]
 
 
@@ -137,6 +137,7 @@ def cache_get(key: str) -> str | None:
 def cache_set(key: str, val: str) -> None:
     # basic size control
     if len(_answer_cache) >= MAX_CACHE_ITEMS:
+        # remove oldest entry
         oldest_key = min(_answer_cache.items(), key=lambda kv: kv[1][0])[0]
         _answer_cache.pop(oldest_key, None)
     _answer_cache[key] = (time.time(), val)
@@ -188,7 +189,7 @@ def format_docs(docs) -> str:
 
 
 # -------------------------
-# Lightweight reranking (baseline)
+# Lightweight reranking (keyword overlap baseline)
 # -------------------------
 STOPWORDS = {
     "the","a","an","and","or","to","of","in","on","for","with","is","are","was","were",
@@ -203,10 +204,6 @@ def tokenize(text: str) -> set[str]:
 
 
 def rerank_docs(query: str, docs: List) -> List:
-    """
-    Simple keyword-overlap reranker to improve relevance without heavy ML models.
-    Later you can swap this for a real reranker.
-    """
     q_tokens = tokenize(query)
     if not q_tokens:
         return docs[:FINAL_K]
@@ -231,8 +228,6 @@ def retrieve_and_prepare_context(user_q: str) -> str:
 @lru_cache(maxsize=1)
 def get_chain():
     llm = get_llm()
-
-    # Build context dynamically per query (retrieve -> rerank -> format)
     context_runnable = RunnableLambda(lambda q: retrieve_and_prepare_context(q))
 
     chain = (
@@ -255,10 +250,15 @@ def index():
     return render_template("chat.html")
 
 
-# ✅ HEALTH ENDPOINT (for uptime checks + debugging)
 @app.route("/health")
 def health():
     return "ok", 200
+
+
+@app.route("/warmup")
+def warmup():
+    # optional warm route (useful for uptime pings if you prefer this)
+    return "warmed", 200
 
 
 @app.route("/get", methods=["GET", "POST"])
@@ -283,8 +283,11 @@ def chat():
     try:
         logging.info(f"Incoming question: {msg[:200]}")
 
-        chain = get_chain()  # cached chain builder
+        chain = get_chain()  # cached chain (fast)
+        start = time.perf_counter()
         response = chain.invoke(msg)
+        elapsed = time.perf_counter() - start
+        logging.info(f"Latency_seconds={elapsed:.2f}")
 
         if isinstance(response, str) and response.strip():
             cache_set(cache_key, response)
