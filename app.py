@@ -201,7 +201,7 @@ def tokenize(text: str) -> set[str]:
 def rerank_docs(query: str, docs: List) -> List:
     """
     Simple keyword-overlap reranker to improve relevance without heavy ML models.
-    Safe for Render free tier. Later you can swap this for a real reranker.
+    Later you can swap this for a real reranker.
     """
     q_tokens = tokenize(query)
     if not q_tokens:
@@ -255,24 +255,35 @@ def index():
 @app.route("/get", methods=["GET", "POST"])
 def chat():
     msg = request.values.get("msg", "")
-    if not msg.strip():
+    msg = (msg or "").strip()
+
+    if not msg:
         return "Please enter a question."
 
+    # 1) Guardrails first
+    safety = guardrail_response(msg)
+    if safety:
+        return safety
+
+    # 2) Cache next
+    cached = cache_get(msg.lower())
+    if cached:
+        return cached
+
     try:
-        logging.info(f"Incoming question: {msg}")
+        logging.info(f"Incoming question: {msg[:200]}")
 
-        chain = rag_chain
-        logging.info("Chain ready")
-
+        chain = get_chain()  # ✅ FIX: use your cached chain builder
         response = chain.invoke(msg)
-        logging.info("Response generated successfully")
+
+        if isinstance(response, str) and response.strip():
+            cache_set(msg.lower(), response)
 
         return response
 
     except Exception as e:
         logging.exception("RAG invocation failed")
         return f"SERVER ERROR: {str(e)}"
-
 
 
 # -------------------------
