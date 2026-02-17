@@ -14,7 +14,7 @@ from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 from langchain_groq import ChatGroq
 
-from src.prompt import system_prompt  # keep your system prompt in src/prompt.py
+from src.prompt import system_prompt
 
 
 # -------------------------
@@ -44,18 +44,15 @@ if missing:
 # Config
 # -------------------------
 INDEX_NAME = "medical-chatbot-bge"
-
-# Retrieve more candidates (k=12) then rerank down to top 3
 RETRIEVE_K = 12
 FINAL_K = 3
 
-# In-memory caching for repeated questions
-CACHE_TTL_SECONDS = 10 * 60  # 10 minutes
+CACHE_TTL_SECONDS = 10 * 60
 MAX_CACHE_ITEMS = 256
 
 
 # -------------------------
-# Lightweight safety guardrails (rule-based)
+# Guardrails
 # -------------------------
 EMERGENCY_PATTERNS = [
     r"\bchest pain\b",
@@ -67,39 +64,40 @@ EMERGENCY_PATTERNS = [
     r"\bstroke\b",
     r"\bface droop\b",
     r"\bslurred speech\b",
-    r"\bone[-\s]?sided weakness\b",
+    r"\bone-sided weakness\b",
     r"\bsuicid(al|e)\b",
-    r"\bself[-\s]?harm\b",
+    r"\bself-harm\b",
     r"\boverdose\b",
     r"\bheavy bleeding\b",
     r"\bcan'?t stop bleeding\b",
 ]
 
-# ✅ Expanded to catch “How much paracetamol should I take”, “How often…”, etc.
 MED_ADVICE_PATTERNS = [
     r"\bdosage\b",
     r"\bdose\b",
-    r"\bhow much\b",  # catches “How much paracetamol…”
-    r"\bhow many\b",
+    r"\bhow much\b",
     r"\bhow often\b",
-    r"\bfrequency\b",
-    r"\bmg\b|\bmilligram(s)?\b|\bml\b",
+    r"\bhow many\b",
+    r"\bmg\b|\bml\b|\bmilligram\b",
     r"\bshould i take\b",
     r"\bcan i take\b",
-    r"\bcan i use\b",
-    r"\bwhat should i take\b",
-    r"\bwhat medicine\b|\bwhich medicine\b|\bwhat medication\b|\bwhich medication\b",
-    r"\bprescription\b",
+    r"\bwhat medicine\b|\bwhich medicine\b",
     r"\bdrug interaction\b|\binteract\b",
-    r"\bsafe to take\b",
+    r"\bside effects\b.*\bmed",
+]
+
+NON_MEDICAL_RECOMMENDATION_PATTERNS = [
+    r"\bbest\b.*\bhospital\b",
+    r"\btop\b.*\bhospital\b",
+    r"\brecommend\b.*\bhospital\b",
+    r"\bnearest\b.*\bhospital\b",
+    r"\bnear me\b",
+    r"\bin .* hospital\b",
+    r"\bwhich hospital\b.*\bgo\b",
 ]
 
 
 def guardrail_response(user_text: str) -> str | None:
-    """
-    Returns a safety response string if the message triggers a guardrail,
-    otherwise returns None to continue normal RAG flow.
-    """
     t = user_text.lower().strip()
 
     for pat in EMERGENCY_PATTERNS:
@@ -108,6 +106,10 @@ def guardrail_response(user_text: str) -> str | None:
                 "This could be a medical emergency. Please seek immediate medical care "
                 "or call your local emergency number right now."
             )
+
+    for pat in NON_MEDICAL_RECOMMENDATION_PATTERNS:
+        if re.search(pat, t):
+            return "I couldn't find medical information about that in my knowledge base."
 
     for pat in MED_ADVICE_PATTERNS:
         if re.search(pat, t):
@@ -120,7 +122,7 @@ def guardrail_response(user_text: str) -> str | None:
 
 
 # -------------------------
-# Caching helpers (simple TTL cache)
+# Cache
 # -------------------------
 _answer_cache: dict[str, Tuple[float, str]] = {}
 
@@ -137,7 +139,6 @@ def cache_get(key: str) -> str | None:
 
 
 def cache_set(key: str, val: str) -> None:
-    # basic size control
     if len(_answer_cache) >= MAX_CACHE_ITEMS:
         oldest_key = min(_answer_cache.items(), key=lambda kv: kv[1][0])[0]
         _answer_cache.pop(oldest_key, None)
@@ -145,11 +146,10 @@ def cache_set(key: str, val: str) -> None:
 
 
 # -------------------------
-# Model + vectorstore (cached in memory)
+# Models
 # -------------------------
 @lru_cache(maxsize=1)
 def get_embeddings():
-    # FastEmbed (no torch)
     return FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 
 
@@ -163,19 +163,12 @@ def get_vectorstore():
 
 @lru_cache(maxsize=1)
 def get_retriever():
-    return get_vectorstore().as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": RETRIEVE_K},
-    )
+    return get_vectorstore().as_retriever(search_kwargs={"k": RETRIEVE_K})
 
 
 @lru_cache(maxsize=1)
 def get_llm():
-    return ChatGroq(
-        model="llama-3.1-8b-instant",
-        temperature=0.2,
-        api_key=GROQ_API_KEY,
-    )
+    return ChatGroq(model="llama-3.1-8b-instant", temperature=0.2, api_key=GROQ_API_KEY)
 
 
 prompt = ChatPromptTemplate.from_messages(
@@ -186,67 +179,37 @@ prompt = ChatPromptTemplate.from_messages(
 )
 
 
-def format_docs(docs) -> str:
-    return "\n\n".join(d.page_content for d in docs)
-
-
 # -------------------------
-# Lightweight reranking (free + safe baseline)
+# Reranking
 # -------------------------
-STOPWORDS = {
-    "the","a","an","and","or","to","of","in","on","for","with","is","are","was","were",
-    "be","been","being","as","at","by","from","that","this","it","you","your","i","we",
-    "they","them","their","but","not","do","does","did","can","could","should","would"
-}
-
+STOPWORDS = {"the","a","an","and","or","to","of","in","on","for","with","is","are","was","were"}
 
 def tokenize(text: str) -> set[str]:
-    words = re.findall(r"[a-zA-Z0-9]+", text.lower())
-    return {w for w in words if w not in STOPWORDS and len(w) > 2}
+    return {w for w in re.findall(r"[a-zA-Z0-9]+", text.lower()) if w not in STOPWORDS and len(w) > 2}
 
 
 def rerank_docs(query: str, docs: List) -> List:
-    """
-    Simple keyword-overlap reranker to improve relevance without heavy ML models.
-    Later you can swap this for a real reranker.
-    """
     q_tokens = tokenize(query)
-    if not q_tokens:
-        return docs[:FINAL_K]
-
-    scored = []
-    for d in docs:
-        d_tokens = tokenize(d.page_content)
-        score = len(q_tokens.intersection(d_tokens))
-        scored.append((score, d))
-
+    scored = [(len(q_tokens.intersection(tokenize(d.page_content))), d) for d in docs]
     scored.sort(key=lambda x: x[0], reverse=True)
-    top = [d for score, d in scored[:FINAL_K]]
-    return top
+    return [d for _, d in scored[:FINAL_K]]
 
 
 def retrieve_and_prepare_context(user_q: str) -> str:
-    retriever = get_retriever()
-    docs = retriever.invoke(user_q)  # List[Document]
+    docs = get_retriever().invoke(user_q)
     docs = rerank_docs(user_q, docs)
-    return format_docs(docs)
+    return "\n\n".join(d.page_content for d in docs)
 
 
 @lru_cache(maxsize=1)
 def get_chain():
-    llm = get_llm()
     context_runnable = RunnableLambda(lambda q: retrieve_and_prepare_context(q))
-
-    chain = (
-        {
-            "context": context_runnable,
-            "input": RunnablePassthrough(),
-        }
+    return (
+        {"context": context_runnable, "input": RunnablePassthrough()}
         | prompt
-        | llm
+        | get_llm()
         | StrOutputParser()
     )
-    return chain
 
 
 # -------------------------
@@ -257,63 +220,42 @@ def index():
     return render_template("chat.html")
 
 
-def normalize_short_query(q: str) -> str:
-    """
-    Improves retrieval for very short queries like 'fracture?' or 'asthma'
-    by converting them into a clearer question form.
-    """
-    cleaned = q.strip()
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    token_count = len(cleaned.split())
-
-    # If it's 1–2 words, convert to "What is <term>?"
-    if token_count <= 2:
-        term = cleaned.rstrip(" ?!.")
-        if term:
-            return f"What is {term}?"
-    return cleaned
+@app.route("/health")
+def health():
+    return "ok", 200
 
 
 @app.route("/get", methods=["GET", "POST"])
 def chat():
-    msg = request.values.get("msg", "")
-    msg = (msg or "").strip()
-
+    msg = (request.values.get("msg", "") or "").strip()
     if not msg:
         return "Please enter a question."
 
-    # ✅ Normalize short queries to improve retrieval
-    msg_norm = normalize_short_query(msg)
+    # normalize short queries
+    if len(msg.split()) <= 2:
+        msg = f"What is {msg.rstrip('?')}?"
 
-    # 1) Guardrails first (use normalized text too)
-    safety = guardrail_response(msg_norm)
+    safety = guardrail_response(msg)
     if safety:
         return safety
 
-    # 2) Cache next (cache using normalized form)
-    cache_key = msg_norm.lower()
-    cached = cache_get(cache_key)
+    cached = cache_get(msg.lower())
     if cached:
         return cached
 
     try:
-        logging.info(f"Incoming question: {msg_norm[:200]}")
-
-        chain = get_chain()
-        response = chain.invoke(msg_norm)
-
-        if isinstance(response, str) and response.strip():
-            cache_set(cache_key, response)
-
+        logging.info(f"Incoming question: {msg}")
+        response = get_chain().invoke(msg)
+        if response.strip():
+            cache_set(msg.lower(), response)
         return response
-
     except Exception as e:
         logging.exception("RAG invocation failed")
         return f"SERVER ERROR: {str(e)}"
 
 
 # -------------------------
-# Run (local dev only)
+# Run
 # -------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
