@@ -67,23 +67,31 @@ EMERGENCY_PATTERNS = [
     r"\bstroke\b",
     r"\bface droop\b",
     r"\bslurred speech\b",
-    r"\bone-sided weakness\b",
+    r"\bone[-\s]?sided weakness\b",
     r"\bsuicid(al|e)\b",
-    r"\bself-harm\b",
+    r"\bself[-\s]?harm\b",
     r"\boverdose\b",
     r"\bheavy bleeding\b",
     r"\bcan'?t stop bleeding\b",
 ]
 
+# ✅ Expanded to catch “How much paracetamol should I take”, “How often…”, etc.
 MED_ADVICE_PATTERNS = [
     r"\bdosage\b",
     r"\bdose\b",
-    r"\bhow much\b.*\bmg\b",
-    r"\bpregnan(t|cy)\b.*\bmed(ic|icine)\b",
+    r"\bhow much\b",  # catches “How much paracetamol…”
+    r"\bhow many\b",
+    r"\bhow often\b",
+    r"\bfrequency\b",
+    r"\bmg\b|\bmilligram(s)?\b|\bml\b",
+    r"\bshould i take\b",
+    r"\bcan i take\b",
+    r"\bcan i use\b",
+    r"\bwhat should i take\b",
+    r"\bwhat medicine\b|\bwhich medicine\b|\bwhat medication\b|\bwhich medication\b",
     r"\bprescription\b",
-    r"\bshould I take\b",
-    r"\bcan I take\b",
-    r"\bdrug interaction\b",
+    r"\bdrug interaction\b|\binteract\b",
+    r"\bsafe to take\b",
 ]
 
 
@@ -131,7 +139,6 @@ def cache_get(key: str) -> str | None:
 def cache_set(key: str, val: str) -> None:
     # basic size control
     if len(_answer_cache) >= MAX_CACHE_ITEMS:
-        # remove oldest entry
         oldest_key = min(_answer_cache.items(), key=lambda kv: kv[1][0])[0]
         _answer_cache.pop(oldest_key, None)
     _answer_cache[key] = (time.time(), val)
@@ -228,8 +235,6 @@ def retrieve_and_prepare_context(user_q: str) -> str:
 @lru_cache(maxsize=1)
 def get_chain():
     llm = get_llm()
-
-    # Build context dynamically per query (retrieve -> rerank -> format)
     context_runnable = RunnableLambda(lambda q: retrieve_and_prepare_context(q))
 
     chain = (
@@ -252,6 +257,23 @@ def index():
     return render_template("chat.html")
 
 
+def normalize_short_query(q: str) -> str:
+    """
+    Improves retrieval for very short queries like 'fracture?' or 'asthma'
+    by converting them into a clearer question form.
+    """
+    cleaned = q.strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    token_count = len(cleaned.split())
+
+    # If it's 1–2 words, convert to "What is <term>?"
+    if token_count <= 2:
+        term = cleaned.rstrip(" ?!.")
+        if term:
+            return f"What is {term}?"
+    return cleaned
+
+
 @app.route("/get", methods=["GET", "POST"])
 def chat():
     msg = request.values.get("msg", "")
@@ -260,24 +282,28 @@ def chat():
     if not msg:
         return "Please enter a question."
 
-    # 1) Guardrails first
-    safety = guardrail_response(msg)
+    # ✅ Normalize short queries to improve retrieval
+    msg_norm = normalize_short_query(msg)
+
+    # 1) Guardrails first (use normalized text too)
+    safety = guardrail_response(msg_norm)
     if safety:
         return safety
 
-    # 2) Cache next
-    cached = cache_get(msg.lower())
+    # 2) Cache next (cache using normalized form)
+    cache_key = msg_norm.lower()
+    cached = cache_get(cache_key)
     if cached:
         return cached
 
     try:
-        logging.info(f"Incoming question: {msg[:200]}")
+        logging.info(f"Incoming question: {msg_norm[:200]}")
 
-        chain = get_chain()  # ✅ FIX: use your cached chain builder
-        response = chain.invoke(msg)
+        chain = get_chain()
+        response = chain.invoke(msg_norm)
 
         if isinstance(response, str) and response.strip():
-            cache_set(msg.lower(), response)
+            cache_set(cache_key, response)
 
         return response
 
