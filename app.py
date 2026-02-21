@@ -55,6 +55,10 @@ FINAL_K = 3
 CACHE_TTL_SECONDS = 10 * 60  # 10 minutes
 MAX_CACHE_ITEMS = 256
 
+# Router: allow answering non-medical questions (e.g., Messi)
+ALLOW_GENERAL_QA = True
+GENERAL_TEMP = 0.4
+
 
 # -------------------------
 # Analytics logging (privacy-safe)
@@ -103,18 +107,35 @@ EMERGENCY_PATTERNS = [
 ]
 
 MED_ADVICE_PATTERNS = [
+    # dosing / frequency
     r"\bdosage\b",
     r"\bdose\b",
     r"\bhow much\b.*\bmg\b",
     r"\bhow often\b.*\b(take|use)\b",
-    r"\bpregnan(t|cy)\b.*\bmed(ic|icine)\b",
-    r"\bprescription\b",
-    r"\bshould i take\b",
-    r"\bcan i take\b",
-    r"\bdrug interaction\b",
+
+    # explicit meds
     r"\bibuprofen\b.*\bhow (often|much)\b",
     r"\bparacetamol\b.*\bhow (often|much)\b",
     r"\bcrocin\b.*\b(dose|how much|how often)\b",
+
+    # prescription / what to take
+    r"\bprescription\b",
+    r"\bprescribed\b",
+    r"\bwhat should i take\b",
+    r"\bwhat medicine\b",
+    r"\bwhich medicine\b",
+    r"\bwhat medication\b",
+    r"\bwhich medication\b",
+    r"\binhaler\b",
+    r"\bantibiotic\b",
+
+    # pregnancy + meds
+    r"\bpregnan(t|cy)\b.*\bmed(ic|icine)\b",
+
+    # interactions
+    r"\bdrug interaction\b",
+    r"\bshould i take\b",
+    r"\bcan i take\b",
 ]
 
 
@@ -163,6 +184,23 @@ def cache_set(key: str, val: str) -> None:
 
 
 # -------------------------
+# Router helper (medical vs non-medical)
+# -------------------------
+MEDICAL_KEYWORDS = [
+    "symptom", "symptoms", "pain", "fever", "cough", "wheezing", "breath", "asthma",
+    "fracture", "infection", "virus", "bacteria", "disease", "medicine", "medication",
+    "tablet", "dose", "hospital", "clinic", "diagnosis", "treatment", "side effect",
+    "blood", "pressure", "diabetes", "cancer", "heart", "chest", "stomach",
+    "headache", "vomit", "nausea", "rash", "injury", "bone", "osteoporosis"
+]
+
+
+def is_medical_query(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in MEDICAL_KEYWORDS)
+
+
+# -------------------------
 # Model + vectorstore (cached in memory)
 # -------------------------
 @lru_cache(maxsize=1)
@@ -188,9 +226,20 @@ def get_retriever():
 
 @lru_cache(maxsize=1)
 def get_llm():
+    # medical RAG LLM
     return ChatGroq(
         model="llama-3.1-8b-instant",
         temperature=0.2,
+        api_key=GROQ_API_KEY,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_general_llm():
+    # non-medical general QA LLM
+    return ChatGroq(
+        model="llama-3.1-8b-instant",
+        temperature=GENERAL_TEMP,
         api_key=GROQ_API_KEY,
     )
 
@@ -259,6 +308,18 @@ def get_chain():
     return chain
 
 
+def general_answer(user_q: str) -> str:
+    llm = get_general_llm()
+    p = ChatPromptTemplate.from_messages(
+        [
+            ("system", "You are a helpful assistant. Keep answers concise."),
+            ("human", "{q}"),
+        ]
+    )
+    chain = p | llm | StrOutputParser()
+    return chain.invoke({"q": user_q})
+
+
 # -------------------------
 # Routes
 # -------------------------
@@ -294,6 +355,7 @@ def chat():
         log_event(
             "request",
             q_hash=q_hash,
+            route="guardrail",
             outcome="guardrail",
             latency_ms=int((time.perf_counter() - t0) * 1000),
         )
@@ -306,6 +368,7 @@ def chat():
         log_event(
             "request",
             q_hash=q_hash,
+            route="cache",
             outcome="cache_hit",
             latency_ms=int((time.perf_counter() - t0) * 1000),
         )
@@ -314,12 +377,35 @@ def chat():
     try:
         logging.info(f"Incoming question: {msg[:200]}")
 
-        # 3) Retrieval (single time) + stats
+        # Decide route
+        use_general = ALLOW_GENERAL_QA and (not is_medical_query(msg))
+
+        if use_general:
+            # General QA (no Pinecone)
+            t_llm = time.perf_counter()
+            response = general_answer(msg)
+            llm_elapsed = time.perf_counter() - t_llm
+            total_elapsed = time.perf_counter() - t0
+
+            if isinstance(response, str) and response.strip():
+                cache_set(cache_key, response)
+
+            log_event(
+                "request",
+                q_hash=q_hash,
+                route="general",
+                outcome="ok",
+                retrieval_latency_ms=0,
+                llm_latency_ms=int(llm_elapsed * 1000),
+                latency_ms=int(total_elapsed * 1000),
+            )
+            return response
+
+        # Medical RAG path
         t_retr = time.perf_counter()
         context_text, doc_before, doc_after = retrieve_and_prepare_context(msg)
         retr_elapsed = time.perf_counter() - t_retr
 
-        # 4) LLM generation (single time) using precomputed context
         chain = get_chain()
         t_llm = time.perf_counter()
         response = chain.invoke({"context": context_text, "input": msg})
@@ -334,6 +420,7 @@ def chat():
         log_event(
             "request",
             q_hash=q_hash,
+            route="rag",
             outcome="ok",
             doc_count=doc_before,
             final_k=doc_after,
@@ -349,6 +436,7 @@ def chat():
         log_event(
             "request",
             q_hash=q_hash,
+            route="error",
             outcome="error",
             error=str(e)[:200],
             latency_ms=int(total_elapsed * 1000),
