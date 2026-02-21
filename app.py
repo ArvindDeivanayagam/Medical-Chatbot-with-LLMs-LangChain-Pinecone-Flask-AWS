@@ -8,7 +8,7 @@ import json
 import hashlib
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_pinecone import PineconeVectorStore
@@ -29,6 +29,7 @@ logging.basicConfig(level=logging.INFO)
 
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+HF_TOKEN = os.environ.get("HF_TOKEN")  # optional but recommended
 
 missing = []
 if not PINECONE_API_KEY:
@@ -39,6 +40,12 @@ if missing:
     raise RuntimeError(
         f"Missing required environment variables: {', '.join(missing)}. "
         f"Set them in Render → Service → Environment."
+    )
+
+if not HF_TOKEN:
+    logging.warning(
+        "HF_TOKEN is not set. HuggingFace downloads may be slower or rate-limited. "
+        "Recommended: set HF_TOKEN in Render environment."
     )
 
 
@@ -74,12 +81,7 @@ def _hash_question(text: str) -> str:
 
 
 def log_event(event: str, **fields) -> None:
-    payload = {
-        "ts": _now_iso(),
-        "event": event,
-        **fields,
-    }
-    # Print is best on Render (shows in Logs)
+    payload = {"ts": _now_iso(), "event": event, **fields}
     print("ANALYTICS " + json.dumps(payload, ensure_ascii=False))
 
 
@@ -128,6 +130,7 @@ MED_ADVICE_PATTERNS = [
     r"\bwhich medication\b",
     r"\binhaler\b",
     r"\bantibiotic\b",
+    r"\bwhat is the prescribed medication\b",
 
     # pregnancy + meds
     r"\bpregnan(t|cy)\b.*\bmed(ic|icine)\b",
@@ -139,7 +142,7 @@ MED_ADVICE_PATTERNS = [
 ]
 
 
-def guardrail_response(user_text: str) -> str | None:
+def guardrail_response(user_text: str) -> Optional[str]:
     t = (user_text or "").lower().strip()
 
     for pat in EMERGENCY_PATTERNS:
@@ -165,7 +168,7 @@ def guardrail_response(user_text: str) -> str | None:
 _answer_cache: dict[str, Tuple[float, str]] = {}
 
 
-def cache_get(key: str) -> str | None:
+def cache_get(key: str) -> Optional[str]:
     item = _answer_cache.get(key)
     if not item:
         return None
@@ -191,13 +194,28 @@ MEDICAL_KEYWORDS = [
     "fracture", "infection", "virus", "bacteria", "disease", "medicine", "medication",
     "tablet", "dose", "hospital", "clinic", "diagnosis", "treatment", "side effect",
     "blood", "pressure", "diabetes", "cancer", "heart", "chest", "stomach",
-    "headache", "vomit", "nausea", "rash", "injury", "bone", "osteoporosis"
+    "headache", "vomit", "vomiting", "nausea", "rash", "injury", "bone",
+    "osteoporosis", "allergy", "allergic", "inflammation", "swelling"
+]
+
+# If a question clearly looks like general knowledge, prefer general route
+GENERAL_HINTS = [
+    "who is", "what is", "capital of", "best laptop", "history of", "define",
+    "country", "president", "prime minister", "football", "messi", "cricket"
 ]
 
 
 def is_medical_query(text: str) -> bool:
     t = (text or "").lower()
-    return any(k in t for k in MEDICAL_KEYWORDS)
+    # if it has any medical keywords, treat as medical
+    if any(k in t for k in MEDICAL_KEYWORDS):
+        return True
+    return False
+
+
+def seems_general_query(text: str) -> bool:
+    t = (text or "").lower().strip()
+    return any(h in t for h in GENERAL_HINTS)
 
 
 # -------------------------
@@ -205,6 +223,7 @@ def is_medical_query(text: str) -> bool:
 # -------------------------
 @lru_cache(maxsize=1)
 def get_embeddings():
+    # FastEmbed may trigger HF downloads on first use depending on backend
     return FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 
 
@@ -287,11 +306,8 @@ def rerank_docs(query: str, docs: List) -> List:
 
 
 def retrieve_and_prepare_context(user_q: str) -> Tuple[str, int, int]:
-    """
-    Returns: (context_text, doc_count_before_rerank, doc_count_after_rerank)
-    """
     retriever = get_retriever()
-    docs = retriever.invoke(user_q)  # List[Document]
+    docs = retriever.invoke(user_q)
     before = len(docs)
     docs = rerank_docs(user_q, docs)
     after = len(docs)
@@ -300,15 +316,12 @@ def retrieve_and_prepare_context(user_q: str) -> Tuple[str, int, int]:
 
 @lru_cache(maxsize=1)
 def get_chain():
-    """
-    Chain takes a dict input: {"context": "...", "input": "..."} to avoid double retrieval.
-    """
     llm = get_llm()
-    chain = prompt | llm | StrOutputParser()
-    return chain
+    return prompt | llm | StrOutputParser()
 
 
-def general_answer(user_q: str) -> str:
+@lru_cache(maxsize=1)
+def get_general_chain():
     llm = get_general_llm()
     p = ChatPromptTemplate.from_messages(
         [
@@ -316,7 +329,11 @@ def general_answer(user_q: str) -> str:
             ("human", "{q}"),
         ]
     )
-    chain = p | llm | StrOutputParser()
+    return p | llm | StrOutputParser()
+
+
+def general_answer(user_q: str) -> str:
+    chain = get_general_chain()
     return chain.invoke({"q": user_q})
 
 
@@ -335,7 +352,31 @@ def health():
 
 @app.route("/warmup")
 def warmup():
-    return "warmed", 200
+    """
+    Warm the service:
+    - Initializes embeddings + Pinecone retriever
+    - Initializes both LLM clients
+    This reduces "first real request" latency on Render free instances.
+    """
+    t0 = time.perf_counter()
+    try:
+        # Load/cold-start the heavy things
+        _ = get_embeddings()
+        _ = get_vectorstore()
+        _ = get_retriever()
+        _ = get_llm()
+        _ = get_general_llm()
+        _ = get_chain()
+        _ = get_general_chain()
+
+        ms = int((time.perf_counter() - t0) * 1000)
+        log_event("warmup", outcome="ok", latency_ms=ms)
+        return "warmed", 200
+    except Exception as e:
+        ms = int((time.perf_counter() - t0) * 1000)
+        log_event("warmup", outcome="error", error=str(e)[:200], latency_ms=ms)
+        logging.exception("Warmup failed")
+        return "warmup_error", 500
 
 
 @app.route("/get", methods=["GET", "POST"])
@@ -349,7 +390,7 @@ def chat():
     q_hash = _hash_question(msg)
     t0 = time.perf_counter()
 
-    # 1) Guardrails first
+    # 1) Guardrails first (always)
     safety = guardrail_response(msg)
     if safety:
         log_event(
@@ -377,8 +418,12 @@ def chat():
     try:
         logging.info(f"Incoming question: {msg[:200]}")
 
-        # Decide route
-        use_general = ALLOW_GENERAL_QA and (not is_medical_query(msg))
+        # Decide route:
+        # - If it looks medical => RAG
+        # - Else if it clearly looks general => general
+        # - Else default to general only if enabled
+        is_med = is_medical_query(msg)
+        use_general = ALLOW_GENERAL_QA and (not is_med) and seems_general_query(msg)
 
         if use_general:
             # General QA (no Pinecone)
@@ -401,7 +446,7 @@ def chat():
             )
             return response
 
-        # Medical RAG path
+        # Medical RAG path (default for medical + also fallback for unclear)
         t_retr = time.perf_counter()
         context_text, doc_before, doc_after = retrieve_and_prepare_context(msg)
         retr_elapsed = time.perf_counter() - t_retr
