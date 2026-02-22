@@ -207,10 +207,7 @@ GENERAL_HINTS = [
 
 def is_medical_query(text: str) -> bool:
     t = (text or "").lower()
-    # if it has any medical keywords, treat as medical
-    if any(k in t for k in MEDICAL_KEYWORDS):
-        return True
-    return False
+    return any(k in t for k in MEDICAL_KEYWORDS)
 
 
 def seems_general_query(text: str) -> bool:
@@ -223,7 +220,11 @@ def seems_general_query(text: str) -> bool:
 # -------------------------
 @lru_cache(maxsize=1)
 def get_embeddings():
-    # FastEmbed may trigger HF downloads on first use depending on backend
+    # Ensure HF token is used by huggingface_hub if present
+    if HF_TOKEN:
+        os.environ.setdefault("HF_TOKEN", HF_TOKEN)
+        os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", HF_TOKEN)
+
     return FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 
 
@@ -272,7 +273,7 @@ prompt = ChatPromptTemplate.from_messages(
 
 
 def format_docs(docs) -> str:
-    return "\n\n".join(d.page_content for d in docs)
+    return "\n\n".join(getattr(d, "page_content", "") for d in docs)
 
 
 # -------------------------
@@ -356,11 +357,11 @@ def warmup():
     Warm the service:
     - Initializes embeddings + Pinecone retriever
     - Initializes both LLM clients
-    This reduces "first real request" latency on Render free instances.
+    - Initializes chains
+    This reduces "first real request" latency after cold starts.
     """
     t0 = time.perf_counter()
     try:
-        # Load/cold-start the heavy things
         _ = get_embeddings()
         _ = get_vectorstore()
         _ = get_retriever()
@@ -421,11 +422,13 @@ def chat():
         # Decide route:
         # - If it looks medical => RAG
         # - Else if it clearly looks general => general
-        # - Else default to general only if enabled
+        # - Else fallback:
+        #    - if general QA enabled => general
+        #    - else => RAG
         is_med = is_medical_query(msg)
-        use_general = ALLOW_GENERAL_QA and (not is_med) and seems_general_query(msg)
+        is_gen_hint = seems_general_query(msg)
 
-        if use_general:
+        if ALLOW_GENERAL_QA and (not is_med) and is_gen_hint:
             # General QA (no Pinecone)
             t_llm = time.perf_counter()
             response = general_answer(msg)
@@ -446,7 +449,7 @@ def chat():
             )
             return response
 
-        # Medical RAG path (default for medical + also fallback for unclear)
+        # Medical RAG path (default for medical + also for unclear queries)
         t_retr = time.perf_counter()
         context_text, doc_before, doc_after = retrieve_and_prepare_context(msg)
         retr_elapsed = time.perf_counter() - t_retr
@@ -487,7 +490,7 @@ def chat():
             latency_ms=int(total_elapsed * 1000),
         )
         logging.exception("RAG invocation failed")
-        return f"SERVER ERROR: {str(e)}"
+        return "Sorry — something went wrong on the server. Please try again."
 
 
 # -------------------------
